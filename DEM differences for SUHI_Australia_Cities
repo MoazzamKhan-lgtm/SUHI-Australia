@@ -1,0 +1,704 @@
+// ============================================================
+// COMPLETE REVISED GEE SCRIPT
+// Multi-DEM Urban–Rural Elevation Analysis
+// Australia 5 Cities
+//
+// Fix included:
+// Avoids "Too many concurrent aggregations" by replacing repeated
+// image.sample() calls with random points + one DEM-stack sampleRegions().
+// ============================================================
+
+
+// ============================================================
+// 1. DEM DATASETS
+// ============================================================
+
+var DEMS = {
+
+  Copernicus: ee.ImageCollection("COPERNICUS/DEM/GLO30")
+    .select("DEM")
+    .mosaic()
+    .rename("elevation"),
+
+  SRTM: ee.Image("USGS/SRTMGL1_003")
+    .select("elevation")
+    .rename("elevation"),
+
+  ALOS: ee.ImageCollection("JAXA/ALOS/AW3D30/V3_2")
+    .select("DSM")
+    .mosaic()
+    .rename("elevation")
+
+};
+
+
+// ============================================================
+// 2. CITY URBAN AND RURAL POLYGONS
+// ============================================================
+
+var CITIES = [
+
+  {
+    name: 'Adelaide',
+    urban: ee.FeatureCollection('users/farhanmoazzam/Adelaide_urban'),
+    rural: ee.FeatureCollection('users/farhanmoazzam/Adelaide_Rural')
+  },
+
+  {
+    name: 'Brisbane',
+    urban: ee.FeatureCollection('users/farhanmoazzam/Brisbane_urban'),
+    rural: ee.FeatureCollection('users/farhanmoazzam/Brsibane_rural')
+  },
+
+  {
+    name: 'Melbourne',
+    urban: ee.FeatureCollection('users/farhanmoazzam/Melbourne_urban'),
+    rural: ee.FeatureCollection('users/farhanmoazzam/Melbourne_rural')
+  },
+
+  {
+    name: 'Perth',
+    urban: ee.FeatureCollection('users/farhanmoazzam/Perth_urbant'),
+    rural: ee.FeatureCollection('users/farhanmoazzam/Perth_rural')
+  },
+
+  {
+    name: 'Sydney',
+    urban: ee.FeatureCollection('users/farhanmoazzam/Sydney_urban'),
+    rural: ee.FeatureCollection('users/farhanmoazzam/Sydney_rural')
+  }
+
+];
+
+
+// ============================================================
+// 3. ANALYSIS SETTINGS
+// ============================================================
+
+var DEM_SCALE = 30;
+var MAX_PIXELS = 1e13;
+var TILE_SCALE = 4;
+
+// Standard environmental lapse rate:
+// -6.5 °C per 1000 m = -0.0065 °C per metre
+var LAPSE_RATE_C_PER_M = -0.0065;
+
+// QA threshold for urban-rural elevation mismatch
+var DELTA_ELEVATION_QA_THRESHOLD_M = 50;
+
+// Random-point sampling settings for distribution plots
+// Keep this moderate. 2000 per zone gives:
+// 5 cities × 2 zones × 2000 = 20,000 points.
+// Each point gets all three DEM values.
+var SAMPLE_POINTS_PER_ZONE = 2000;
+var RANDOM_SEED = 123;
+
+
+// ============================================================
+// 4. VISUALIZATION SETTINGS
+// ============================================================
+
+var elevationVis = {
+  min: 0,
+  max: 600,
+  palette: [
+    '313695',
+    '74add1',
+    'ffffbf',
+    'fdae61',
+    'a50026'
+  ]
+};
+
+var urbanStyle = {
+  color: 'red',
+  fillColor: '00000000',
+  width: 2
+};
+
+var ruralStyle = {
+  color: 'blue',
+  fillColor: '00000000',
+  width: 2
+};
+
+
+// ============================================================
+// 5. COMBINED REDUCER FOR CITY-LEVEL STATS
+// ============================================================
+
+var elevationReducer = ee.Reducer.mean()
+  .combine({
+    reducer2: ee.Reducer.median(),
+    sharedInputs: true
+  })
+  .combine({
+    reducer2: ee.Reducer.min(),
+    sharedInputs: true
+  })
+  .combine({
+    reducer2: ee.Reducer.max(),
+    sharedInputs: true
+  })
+  .combine({
+    reducer2: ee.Reducer.stdDev(),
+    sharedInputs: true
+  })
+  .combine({
+    reducer2: ee.Reducer.count(),
+    sharedInputs: true
+  })
+  .combine({
+    reducer2: ee.Reducer.percentile(
+      [5, 25, 75, 95],
+      ['p5', 'p25', 'p75', 'p95']
+    ),
+    sharedInputs: true
+  });
+
+
+// ============================================================
+// 6. HELPER FUNCTION: AREA IN KM2
+// ============================================================
+
+function getAreaKm2(regionFC) {
+
+  return regionFC.geometry()
+    .area({
+      maxError: 1
+    })
+    .divide(1e6);
+
+}
+
+
+// ============================================================
+// 7. HELPER FUNCTION: REDUCE DEM OVER REGION
+// ============================================================
+
+function getElevationStats(demImage, regionFC) {
+
+  var stats = demImage.reduceRegion({
+    reducer: elevationReducer,
+    geometry: regionFC.geometry(),
+    scale: DEM_SCALE,
+    maxPixels: MAX_PIXELS,
+    tileScale: TILE_SCALE
+  });
+
+  return ee.Dictionary(stats);
+
+}
+
+
+// ============================================================
+// 8. HELPER FUNCTION: BUILD ONE URBAN-RURAL FEATURE
+// ============================================================
+
+function buildUrbanRuralFeature(cityObj, demName, demImage) {
+
+  var urbanStats = getElevationStats(demImage, cityObj.urban);
+  var ruralStats = getElevationStats(demImage, cityObj.rural);
+
+  var urbanMean = ee.Number(urbanStats.get('elevation_mean'));
+  var ruralMean = ee.Number(ruralStats.get('elevation_mean'));
+
+  var urbanMedian = ee.Number(urbanStats.get('elevation_median'));
+  var ruralMedian = ee.Number(ruralStats.get('elevation_median'));
+
+  var deltaElevMean = urbanMean.subtract(ruralMean);
+  var deltaElevMedian = urbanMedian.subtract(ruralMedian);
+
+  var absDeltaElevMean = deltaElevMean.abs();
+
+  var lapseBiasMean = deltaElevMean.multiply(LAPSE_RATE_C_PER_M);
+  var lapseBiasMedian = deltaElevMedian.multiply(LAPSE_RATE_C_PER_M);
+
+  var qaFlag = ee.Algorithms.If(
+    absDeltaElevMean.gt(DELTA_ELEVATION_QA_THRESHOLD_M),
+    'Check: elevation difference may bias SUHI',
+    'OK'
+  );
+
+  var properties = ee.Dictionary({
+
+    city: cityObj.name,
+    dem: demName,
+
+    urban_area_km2: getAreaKm2(cityObj.urban),
+    rural_area_km2: getAreaKm2(cityObj.rural),
+
+    urban_mean_m: urbanStats.get('elevation_mean'),
+    urban_median_m: urbanStats.get('elevation_median'),
+    urban_min_m: urbanStats.get('elevation_min'),
+    urban_max_m: urbanStats.get('elevation_max'),
+    urban_stdDev_m: urbanStats.get('elevation_stdDev'),
+    urban_count: urbanStats.get('elevation_count'),
+    urban_p5_m: urbanStats.get('elevation_p5'),
+    urban_p25_m: urbanStats.get('elevation_p25'),
+    urban_p75_m: urbanStats.get('elevation_p75'),
+    urban_p95_m: urbanStats.get('elevation_p95'),
+
+    rural_mean_m: ruralStats.get('elevation_mean'),
+    rural_median_m: ruralStats.get('elevation_median'),
+    rural_min_m: ruralStats.get('elevation_min'),
+    rural_max_m: ruralStats.get('elevation_max'),
+    rural_stdDev_m: ruralStats.get('elevation_stdDev'),
+    rural_count: ruralStats.get('elevation_count'),
+    rural_p5_m: ruralStats.get('elevation_p5'),
+    rural_p25_m: ruralStats.get('elevation_p25'),
+    rural_p75_m: ruralStats.get('elevation_p75'),
+    rural_p95_m: ruralStats.get('elevation_p95'),
+
+    delta_elevation_mean_m: deltaElevMean,
+    delta_elevation_median_m: deltaElevMedian,
+    abs_delta_elevation_mean_m: absDeltaElevMean,
+
+    lapse_rate_C_per_m: LAPSE_RATE_C_PER_M,
+    lapse_rate_bias_mean_C: lapseBiasMean,
+    lapse_rate_bias_median_C: lapseBiasMedian,
+
+    qa_threshold_m: DELTA_ELEVATION_QA_THRESHOLD_M,
+    qa_flag: qaFlag
+
+  });
+
+  return ee.Feature(null, properties);
+
+}
+
+
+// ============================================================
+// 9. LOOP THROUGH ALL DEMS AND ALL CITIES FOR STATS
+// ============================================================
+
+var outputFeatures = [];
+
+Object.keys(DEMS).forEach(function(demName) {
+
+  var demImage = DEMS[demName];
+
+  CITIES.forEach(function(cityObj) {
+
+    var feature = buildUrbanRuralFeature(
+      cityObj,
+      demName,
+      demImage
+    );
+
+    outputFeatures.push(feature);
+
+  });
+
+});
+
+var urbanRuralElevationStats = ee.FeatureCollection(outputFeatures);
+
+
+// ============================================================
+// 10. QA FEATURE COLLECTION
+// ============================================================
+
+var qaProblemFeatures = urbanRuralElevationStats.filter(
+  ee.Filter.gt(
+    'abs_delta_elevation_mean_m',
+    DELTA_ELEVATION_QA_THRESHOLD_M
+  )
+);
+
+
+// ============================================================
+// 11. PRINT MAIN TABLES
+// ============================================================
+
+print(
+  'Urban–Rural elevation statistics: 5 cities × 3 DEMs',
+  urbanRuralElevationStats
+);
+
+print(
+  'First feature preview',
+  urbanRuralElevationStats.first()
+);
+
+print(
+  'Cases where urban-rural elevation difference exceeds QA threshold',
+  qaProblemFeatures
+);
+
+
+// ============================================================
+// 12. CHART: DELTA ELEVATION BY CITY AND DEM
+// ============================================================
+
+var deltaElevationChart = ui.Chart.feature.groups({
+  features: urbanRuralElevationStats,
+  xProperty: 'city',
+  yProperty: 'delta_elevation_mean_m',
+  seriesProperty: 'dem'
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Urban - Rural Mean Elevation Difference',
+  hAxis: {
+    title: 'City'
+  },
+  vAxis: {
+    title: 'ΔElevation mean, urban - rural (m)'
+  },
+  legend: {
+    position: 'right'
+  }
+});
+
+print(deltaElevationChart);
+
+
+// ============================================================
+// 13. CHART: LAPSE-RATE TEMPERATURE BIAS
+// ============================================================
+
+var lapseBiasChart = ui.Chart.feature.groups({
+  features: urbanRuralElevationStats,
+  xProperty: 'city',
+  yProperty: 'lapse_rate_bias_mean_C',
+  seriesProperty: 'dem'
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Approximate Lapse-Rate Temperature Bias',
+  hAxis: {
+    title: 'City'
+  },
+  vAxis: {
+    title: 'Temperature bias from ΔElevation, °C'
+  },
+  legend: {
+    position: 'right'
+  }
+});
+
+print(lapseBiasChart);
+
+
+// ============================================================
+// 14. CHART: URBAN MEAN ELEVATION
+// ============================================================
+
+var urbanMeanChart = ui.Chart.feature.groups({
+  features: urbanRuralElevationStats,
+  xProperty: 'city',
+  yProperty: 'urban_mean_m',
+  seriesProperty: 'dem'
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Urban Mean Elevation',
+  hAxis: {
+    title: 'City'
+  },
+  vAxis: {
+    title: 'Urban mean elevation, m'
+  },
+  legend: {
+    position: 'right'
+  }
+});
+
+print(urbanMeanChart);
+
+
+// ============================================================
+// 15. CHART: RURAL MEAN ELEVATION
+// ============================================================
+
+var ruralMeanChart = ui.Chart.feature.groups({
+  features: urbanRuralElevationStats,
+  xProperty: 'city',
+  yProperty: 'rural_mean_m',
+  seriesProperty: 'dem'
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Rural Mean Elevation',
+  hAxis: {
+    title: 'City'
+  },
+  vAxis: {
+    title: 'Rural mean elevation, m'
+  },
+  legend: {
+    position: 'right'
+  }
+});
+
+print(ruralMeanChart);
+
+
+// ============================================================
+// 16. MAP QA VIEW
+// Change these values to display another city or DEM.
+// ============================================================
+
+var DISPLAY_CITY_NAME = 'Melbourne';
+var DISPLAY_DEM_NAME = 'Copernicus';
+
+function getCityByName(cityName) {
+
+  var selected = null;
+
+  CITIES.forEach(function(cityObj) {
+    if (cityObj.name === cityName) {
+      selected = cityObj;
+    }
+  });
+
+  return selected;
+
+}
+
+var displayCity = getCityByName(DISPLAY_CITY_NAME);
+var displayDEM = DEMS[DISPLAY_DEM_NAME];
+
+var displayRegion = displayCity.urban
+  .merge(displayCity.rural)
+  .geometry();
+
+Map.centerObject(displayRegion, 9);
+
+Map.addLayer(
+  displayDEM.clip(displayRegion),
+  elevationVis,
+  DISPLAY_DEM_NAME + ' elevation: ' + DISPLAY_CITY_NAME
+);
+
+Map.addLayer(
+  displayCity.rural.style(ruralStyle),
+  {},
+  DISPLAY_CITY_NAME + ' rural polygon'
+);
+
+Map.addLayer(
+  displayCity.urban.style(urbanStyle),
+  {},
+  DISPLAY_CITY_NAME + ' urban polygon'
+);
+
+
+// ============================================================
+// 17. OPTIONAL HISTOGRAMS FOR SELECTED CITY AND DEM
+// These are only for the selected city/DEM, so they are safe.
+// ============================================================
+
+var urbanHistogram = ui.Chart.image.histogram({
+  image: displayDEM,
+  region: displayCity.urban.geometry(),
+  scale: DEM_SCALE,
+  maxBuckets: 60
+})
+.setOptions({
+  title: DISPLAY_CITY_NAME + ' urban elevation histogram: ' + DISPLAY_DEM_NAME,
+  hAxis: {
+    title: 'Elevation, m'
+  },
+  vAxis: {
+    title: 'Pixel count'
+  },
+  legend: {
+    position: 'none'
+  }
+});
+
+print(urbanHistogram);
+
+
+var ruralHistogram = ui.Chart.image.histogram({
+  image: displayDEM,
+  region: displayCity.rural.geometry(),
+  scale: DEM_SCALE,
+  maxBuckets: 60
+})
+.setOptions({
+  title: DISPLAY_CITY_NAME + ' rural elevation histogram: ' + DISPLAY_DEM_NAME,
+  hAxis: {
+    title: 'Elevation, m'
+  },
+  vAxis: {
+    title: 'Pixel count'
+  },
+  legend: {
+    position: 'none'
+  }
+});
+
+print(ruralHistogram);
+
+
+// ============================================================
+// 18. ROBUST PIXEL-LEVEL SAMPLING
+// ============================================================
+//
+// This replaces the earlier repeated image.sample() approach.
+//
+// New logic:
+// 1. Generate random points inside each urban/rural zone.
+// 2. Stack all three DEMs into one image.
+// 3. Use sampleRegions() once on the DEM stack.
+//
+// This avoids "Too many concurrent aggregations".
+// ============================================================
+
+
+// ------------------------------------------------------------
+// 18.1 Build DEM stack
+// ------------------------------------------------------------
+
+var demStack = DEMS.Copernicus.rename('Copernicus_elevation_m')
+  .addBands(DEMS.SRTM.rename('SRTM_elevation_m'))
+  .addBands(DEMS.ALOS.rename('ALOS_elevation_m'));
+
+
+// ------------------------------------------------------------
+// 18.2 Generate random points for all cities and zones
+// ------------------------------------------------------------
+
+function makeRandomPoints(regionFC, cityName, zoneName, seedOffset) {
+
+  var points = ee.FeatureCollection.randomPoints({
+    region: regionFC.geometry(),
+    points: SAMPLE_POINTS_PER_ZONE,
+    seed: RANDOM_SEED + seedOffset,
+    maxError: 1
+  });
+
+  points = points.map(function(f) {
+    return f.set({
+      city: cityName,
+      zone: zoneName
+    });
+  });
+
+  return points;
+
+}
+
+
+var pointCollections = [];
+
+CITIES.forEach(function(cityObj, index) {
+
+  var urbanPoints = makeRandomPoints(
+    cityObj.urban,
+    cityObj.name,
+    'Urban',
+    index * 10 + 1
+  );
+
+  var ruralPoints = makeRandomPoints(
+    cityObj.rural,
+    cityObj.name,
+    'Rural',
+    index * 10 + 2
+  );
+
+  pointCollections.push(urbanPoints);
+  pointCollections.push(ruralPoints);
+
+});
+
+var samplePoints = ee.FeatureCollection(pointCollections).flatten();
+
+print(
+  'Random sample points preview',
+  samplePoints.limit(10)
+);
+
+
+// ------------------------------------------------------------
+// 18.3 Sample all three DEMs at the random points
+// ------------------------------------------------------------
+
+var elevationPointSamples = demStack.sampleRegions({
+  collection: samplePoints,
+  scale: DEM_SCALE,
+  geometries: false,
+  tileScale: TILE_SCALE
+});
+
+print(
+  'Elevation point samples preview',
+  elevationPointSamples.limit(10)
+);
+
+
+// ============================================================
+// 19. EXPORT MAIN CSV TABLE
+// ============================================================
+
+Export.table.toDrive({
+  collection: urbanRuralElevationStats,
+  description: 'Australia_5Cities_Urban_Rural_Elevation_Stats_3DEMs',
+  fileNamePrefix: 'Australia_5Cities_Urban_Rural_Elevation_Stats_3DEMs',
+  fileFormat: 'CSV'
+});
+
+
+// ============================================================
+// 20. EXPORT QA-ONLY CSV TABLE
+// ============================================================
+
+Export.table.toDrive({
+  collection: qaProblemFeatures,
+  description: 'Australia_5Cities_Elevation_QA_Flags_3DEMs',
+  fileNamePrefix: 'Australia_5Cities_Elevation_QA_Flags_3DEMs',
+  fileFormat: 'CSV'
+});
+
+
+// ============================================================
+// 21. EXPORT PIXEL/POINT-LEVEL SAMPLE CSV
+// ============================================================
+//
+// This file is wide format:
+// city, zone, Copernicus_elevation_m, SRTM_elevation_m, ALOS_elevation_m
+//
+// In Python, you can reshape it to long format for boxplots/violin plots.
+// ============================================================
+
+Export.table.toDrive({
+  collection: elevationPointSamples,
+  description: 'Australia_5Cities_Urban_Rural_Elevation_PointSamples_3DEMs',
+  fileNamePrefix: 'Australia_5Cities_Urban_Rural_Elevation_PointSamples_3DEMs',
+  fileFormat: 'CSV'
+});
+
+
+// ============================================================
+// 22. INTERPRETATION NOTES
+// ============================================================
+//
+// delta_elevation_mean_m = urban_mean_m - rural_mean_m
+//
+// If delta_elevation_mean_m > 0:
+//   urban area is higher than rural area.
+//
+// If delta_elevation_mean_m < 0:
+//   urban area is lower than rural area.
+//
+// lapse_rate_bias_mean_C = delta_elevation_mean_m × -0.0065
+//
+// Example:
+//   urban is 100 m lower than rural
+//   delta = -100 m
+//   bias = -100 × -0.0065 = +0.65 °C
+//
+// That means apparent urban warming may be enhanced partly because
+// the urban zone is lower than the rural reference.
+//
+// The point-sample export can be used for:
+//   - urban/rural elevation boxplots
+//   - violin plots
+//   - DEM uncertainty plots
+//   - elevation distribution overlap analysis
+//
+// ============================================================
