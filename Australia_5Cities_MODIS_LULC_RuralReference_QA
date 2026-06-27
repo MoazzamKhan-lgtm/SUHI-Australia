@@ -1,0 +1,761 @@
+// ============================================================
+// COMPLETE GEE SCRIPT
+// MODIS LULC Evaluation of Urban and Rural Reference Regions
+// Australia 5 Cities
+//
+// Purpose:
+// To respond to reviewer concern about whether rural reference
+// regions are natural/undisturbed or disturbed landscapes such as
+// croplands, mosaics, built-up areas, etc.
+//
+// Dataset:
+// MODIS MCD12Q1 Version 6.1
+// Band:
+// LC_Type1 = IGBP annual land-cover classification
+//
+// Study years:
+// 2003–2024, because MODIS MCD12Q1 in GEE is available annually
+// up to 2024 at the time of writing.
+// ============================================================
+
+
+// ============================================================
+// 1. CITY URBAN AND RURAL POLYGONS
+// ============================================================
+
+var CITIES = [
+
+  {
+    name: 'Adelaide',
+    urban: ee.FeatureCollection('users/farhanmoazzam/Adelaide_urban'),
+    rural: ee.FeatureCollection('users/farhanmoazzam/Adelaide_Rural')
+  },
+
+  {
+    name: 'Brisbane',
+    urban: ee.FeatureCollection('users/farhanmoazzam/Brisbane_urban'),
+    rural: ee.FeatureCollection('users/farhanmoazzam/Brsibane_rural')
+  },
+
+  {
+    name: 'Melbourne',
+    urban: ee.FeatureCollection('users/farhanmoazzam/Melbourne_urban'),
+    rural: ee.FeatureCollection('users/farhanmoazzam/Melbourne_rural')
+  },
+
+  {
+    name: 'Perth',
+    urban: ee.FeatureCollection('users/farhanmoazzam/Perth_urbant'),
+    rural: ee.FeatureCollection('users/farhanmoazzam/Perth_rural')
+  },
+
+  {
+    name: 'Sydney',
+    urban: ee.FeatureCollection('users/farhanmoazzam/Sydney_urban'),
+    rural: ee.FeatureCollection('users/farhanmoazzam/Sydney_rural')
+  }
+
+];
+
+
+// ============================================================
+// 2. MODIS LAND COVER SETTINGS
+// ============================================================
+
+var START_YEAR = 2003;
+var END_YEAR = 2024;
+
+var MODIS_LC = ee.ImageCollection('MODIS/061/MCD12Q1');
+
+var LC_SCALE = 500;
+var MAX_PIXELS = 1e13;
+var TILE_SCALE = 4;
+
+
+// ============================================================
+// 3. MODIS IGBP CLASS GROUPING
+// ============================================================
+//
+// LC_Type1 IGBP classes:
+//
+// 1  Evergreen Needleleaf Forest
+// 2  Evergreen Broadleaf Forest
+// 3  Deciduous Needleleaf Forest
+// 4  Deciduous Broadleaf Forest
+// 5  Mixed Forest
+// 6  Closed Shrubland
+// 7  Open Shrubland
+// 8  Woody Savanna
+// 9  Savanna
+// 10 Grassland
+// 11 Permanent Wetland
+// 12 Cropland
+// 13 Urban and Built-up
+// 14 Cropland/Natural Vegetation Mosaic
+// 15 Permanent Snow and Ice
+// 16 Barren
+// 17 Water
+//
+// For reviewer response:
+//
+// Natural/semi-natural vegetation:
+// forest + shrubland + savanna + grassland + wetland
+//
+// Disturbed/managed landscape:
+// cropland + cropland/natural vegetation mosaic + built-up
+// ============================================================
+
+
+// ============================================================
+// 4. HELPER FUNCTION: GET LAND-COVER IMAGE FOR ONE YEAR
+// ============================================================
+
+function getLCImage(year) {
+
+  year = ee.Number(year);
+
+  var img = MODIS_LC
+    .filter(ee.Filter.calendarRange(year, year, 'year'))
+    .first()
+    .select('LC_Type1')
+    .rename('lc');
+
+  return img;
+
+}
+
+
+// ============================================================
+// 5. HELPER FUNCTION: BUILD AREA IMAGE BY CLASS GROUP
+// ============================================================
+
+function buildAreaImage(lc) {
+
+  var areaKm2 = ee.Image.pixelArea().divide(1e6);
+
+  var valid = lc.gte(1).and(lc.lte(17));
+
+  // Main land-cover groups
+  var forest = lc.gte(1).and(lc.lte(5));
+  var shrubland = lc.eq(6).or(lc.eq(7));
+  var savanna = lc.eq(8).or(lc.eq(9));
+  var grassland = lc.eq(10);
+  var wetland = lc.eq(11);
+
+  var cropland = lc.eq(12);
+  var builtup = lc.eq(13);
+  var cropMosaic = lc.eq(14);
+
+  var snowIce = lc.eq(15);
+  var barren = lc.eq(16);
+  var water = lc.eq(17);
+
+  // Aggregated reviewer-relevant classes
+  var naturalVeg = forest
+    .or(shrubland)
+    .or(savanna)
+    .or(grassland)
+    .or(wetland);
+
+  var croplandTotal = cropland.or(cropMosaic);
+
+  var disturbedManaged = cropland
+    .or(cropMosaic)
+    .or(builtup);
+
+  var land = valid.and(water.not());
+
+  var areaImage = ee.Image.cat([
+
+    areaKm2.updateMask(forest).rename('forest_km2'),
+    areaKm2.updateMask(shrubland).rename('shrubland_km2'),
+    areaKm2.updateMask(savanna).rename('savanna_km2'),
+    areaKm2.updateMask(grassland).rename('grassland_km2'),
+    areaKm2.updateMask(wetland).rename('wetland_km2'),
+
+    areaKm2.updateMask(cropland).rename('cropland_km2'),
+    areaKm2.updateMask(cropMosaic).rename('cropland_mosaic_km2'),
+    areaKm2.updateMask(builtup).rename('builtup_km2'),
+
+    areaKm2.updateMask(snowIce).rename('snow_ice_km2'),
+    areaKm2.updateMask(barren).rename('barren_km2'),
+    areaKm2.updateMask(water).rename('water_km2'),
+
+    areaKm2.updateMask(naturalVeg).rename('natural_vegetation_km2'),
+    areaKm2.updateMask(croplandTotal).rename('cropland_total_km2'),
+    areaKm2.updateMask(disturbedManaged).rename('disturbed_managed_km2'),
+
+    areaKm2.updateMask(valid).rename('total_valid_area_km2'),
+    areaKm2.updateMask(land).rename('total_land_area_km2')
+
+  ]);
+
+  return areaImage;
+
+}
+
+
+// ============================================================
+// 6. HELPER FUNCTION: SAFE NUMBER FROM DICTIONARY
+// ============================================================
+
+function getNumber(dict, key) {
+  return ee.Number(ee.Dictionary(dict).get(key, 0));
+}
+
+
+// ============================================================
+// 7. HELPER FUNCTION: BUILD ONE ANNUAL FEATURE
+// ============================================================
+
+function buildAnnualLULCFeature(cityName, zoneName, zoneFC, year) {
+
+  var lc = getLCImage(year);
+  var areaImage = buildAreaImage(lc);
+
+  var stats = areaImage.reduceRegion({
+    reducer: ee.Reducer.sum(),
+    geometry: zoneFC.geometry(),
+    scale: LC_SCALE,
+    maxPixels: MAX_PIXELS,
+    tileScale: TILE_SCALE
+  });
+
+  var landArea = getNumber(stats, 'total_land_area_km2');
+  var totalArea = getNumber(stats, 'total_valid_area_km2');
+
+  var forest = getNumber(stats, 'forest_km2');
+  var shrubland = getNumber(stats, 'shrubland_km2');
+  var savanna = getNumber(stats, 'savanna_km2');
+  var grassland = getNumber(stats, 'grassland_km2');
+  var wetland = getNumber(stats, 'wetland_km2');
+
+  var cropland = getNumber(stats, 'cropland_km2');
+  var cropMosaic = getNumber(stats, 'cropland_mosaic_km2');
+  var builtup = getNumber(stats, 'builtup_km2');
+
+  var snowIce = getNumber(stats, 'snow_ice_km2');
+  var barren = getNumber(stats, 'barren_km2');
+  var water = getNumber(stats, 'water_km2');
+
+  var naturalVeg = getNumber(stats, 'natural_vegetation_km2');
+  var croplandTotal = getNumber(stats, 'cropland_total_km2');
+  var disturbedManaged = getNumber(stats, 'disturbed_managed_km2');
+
+  // Percentages relative to land area.
+  // This is important because water should not dominate the denominator.
+  var forestPct = forest.divide(landArea).multiply(100);
+  var shrublandPct = shrubland.divide(landArea).multiply(100);
+  var savannaPct = savanna.divide(landArea).multiply(100);
+  var grasslandPct = grassland.divide(landArea).multiply(100);
+  var wetlandPct = wetland.divide(landArea).multiply(100);
+
+  var croplandPct = cropland.divide(landArea).multiply(100);
+  var cropMosaicPct = cropMosaic.divide(landArea).multiply(100);
+  var builtupPct = builtup.divide(landArea).multiply(100);
+
+  var snowIcePct = snowIce.divide(landArea).multiply(100);
+  var barrenPct = barren.divide(landArea).multiply(100);
+
+  var naturalVegPct = naturalVeg.divide(landArea).multiply(100);
+  var croplandTotalPct = croplandTotal.divide(landArea).multiply(100);
+  var disturbedManagedPct = disturbedManaged.divide(landArea).multiply(100);
+
+  // Water is relative to total valid area.
+  var waterPctTotal = water.divide(totalArea).multiply(100);
+
+  // Reviewer-oriented rural reference flag.
+  var referenceFlag = ee.Algorithms.If(
+    builtupPct.gt(10),
+    'Potential peri-urban contamination: built-up >10%',
+    ee.Algorithms.If(
+      croplandTotalPct.gt(40),
+      'Agricultural/cropland-influenced reference',
+      ee.Algorithms.If(
+        naturalVegPct.gte(70),
+        'Mostly natural or semi-natural vegetation',
+        'Mixed rural reference landscape'
+      )
+    )
+  );
+
+  return ee.Feature(null, {
+
+    city: cityName,
+    zone: zoneName,
+    year: year,
+
+    total_valid_area_km2: totalArea,
+    total_land_area_km2: landArea,
+
+    forest_km2: forest,
+    shrubland_km2: shrubland,
+    savanna_km2: savanna,
+    grassland_km2: grassland,
+    wetland_km2: wetland,
+
+    cropland_km2: cropland,
+    cropland_mosaic_km2: cropMosaic,
+    builtup_km2: builtup,
+
+    snow_ice_km2: snowIce,
+    barren_km2: barren,
+    water_km2: water,
+
+    natural_vegetation_km2: naturalVeg,
+    cropland_total_km2: croplandTotal,
+    disturbed_managed_km2: disturbedManaged,
+
+    forest_pct_land: forestPct,
+    shrubland_pct_land: shrublandPct,
+    savanna_pct_land: savannaPct,
+    grassland_pct_land: grasslandPct,
+    wetland_pct_land: wetlandPct,
+
+    cropland_pct_land: croplandPct,
+    cropland_mosaic_pct_land: cropMosaicPct,
+    builtup_pct_land: builtupPct,
+
+    snow_ice_pct_land: snowIcePct,
+    barren_pct_land: barrenPct,
+    water_pct_total: waterPctTotal,
+
+    natural_vegetation_pct_land: naturalVegPct,
+    cropland_total_pct_land: croplandTotalPct,
+    disturbed_managed_pct_land: disturbedManagedPct,
+
+    rural_reference_flag: referenceFlag
+
+  });
+
+}
+
+
+// ============================================================
+// 8. CREATE ANNUAL LULC COMPOSITION TABLE
+// ============================================================
+
+var annualFeatures = [];
+
+for (var year = START_YEAR; year <= END_YEAR; year++) {
+
+  CITIES.forEach(function(cityObj) {
+
+    annualFeatures.push(
+      buildAnnualLULCFeature(
+        cityObj.name,
+        'Urban',
+        cityObj.urban,
+        year
+      )
+    );
+
+    annualFeatures.push(
+      buildAnnualLULCFeature(
+        cityObj.name,
+        'Rural',
+        cityObj.rural,
+        year
+      )
+    );
+
+  });
+
+}
+
+var annualLULC = ee.FeatureCollection(annualFeatures);
+
+print(
+  'Annual MODIS LULC composition: urban and rural zones',
+  annualLULC.limit(20)
+);
+
+
+// ============================================================
+// 9. PERIOD-MEAN SUMMARY TABLE
+// ============================================================
+
+var summaryProperties = [
+
+  'forest_pct_land',
+  'shrubland_pct_land',
+  'savanna_pct_land',
+  'grassland_pct_land',
+  'wetland_pct_land',
+
+  'cropland_pct_land',
+  'cropland_mosaic_pct_land',
+  'cropland_total_pct_land',
+  'builtup_pct_land',
+
+  'barren_pct_land',
+  'water_pct_total',
+
+  'natural_vegetation_pct_land',
+  'disturbed_managed_pct_land'
+
+];
+
+
+function buildPeriodSummaryFeature(cityName, zoneName) {
+
+  var subset = annualLULC
+    .filter(ee.Filter.eq('city', cityName))
+    .filter(ee.Filter.eq('zone', zoneName));
+
+  var props = ee.Dictionary({
+    city: cityName,
+    zone: zoneName,
+    start_year: START_YEAR,
+    end_year: END_YEAR,
+    n_years: subset.size()
+  });
+
+  summaryProperties.forEach(function(propName) {
+
+    props = props
+      .set('mean_' + propName, subset.aggregate_mean(propName))
+      .set('min_' + propName, subset.aggregate_min(propName))
+      .set('max_' + propName, subset.aggregate_max(propName));
+
+  });
+
+  var meanNatural = ee.Number(props.get('mean_natural_vegetation_pct_land'));
+  var meanCrop = ee.Number(props.get('mean_cropland_total_pct_land'));
+  var meanBuilt = ee.Number(props.get('mean_builtup_pct_land'));
+
+  var overallFlag = ee.Algorithms.If(
+    meanBuilt.gt(10),
+    'Potential peri-urban contamination: built-up >10%',
+    ee.Algorithms.If(
+      meanCrop.gt(40),
+      'Agricultural/cropland-influenced reference',
+      ee.Algorithms.If(
+        meanNatural.gte(70),
+        'Mostly natural or semi-natural vegetation',
+        'Mixed rural reference landscape'
+      )
+    )
+  );
+
+  props = props.set('overall_reference_flag', overallFlag);
+
+  return ee.Feature(null, props);
+
+}
+
+
+var summaryFeatures = [];
+
+CITIES.forEach(function(cityObj) {
+
+  summaryFeatures.push(
+    buildPeriodSummaryFeature(cityObj.name, 'Urban')
+  );
+
+  summaryFeatures.push(
+    buildPeriodSummaryFeature(cityObj.name, 'Rural')
+  );
+
+});
+
+var periodMeanLULC = ee.FeatureCollection(summaryFeatures);
+
+print(
+  'Period-mean MODIS LULC composition: urban and rural zones',
+  periodMeanLULC
+);
+
+
+// ============================================================
+// 10. RURAL-ONLY QA TABLE FOR REVIEWER RESPONSE
+// ============================================================
+
+var ruralReferenceQA = periodMeanLULC
+  .filter(ee.Filter.eq('zone', 'Rural'))
+  .select([
+
+    'city',
+    'zone',
+    'start_year',
+    'end_year',
+    'n_years',
+
+    'mean_natural_vegetation_pct_land',
+    'mean_forest_pct_land',
+    'mean_shrubland_pct_land',
+    'mean_savanna_pct_land',
+    'mean_grassland_pct_land',
+    'mean_wetland_pct_land',
+
+    'mean_cropland_total_pct_land',
+    'mean_cropland_pct_land',
+    'mean_cropland_mosaic_pct_land',
+    'mean_builtup_pct_land',
+    'mean_barren_pct_land',
+    'mean_water_pct_total',
+
+    'mean_disturbed_managed_pct_land',
+    'overall_reference_flag'
+
+  ]);
+
+print(
+  'Rural reference QA table for reviewer response',
+  ruralReferenceQA
+);
+
+
+// ============================================================
+// 11. CHART: RURAL CROPLAND FRACTION THROUGH TIME
+// ============================================================
+
+var ruralAnnual = annualLULC.filter(
+  ee.Filter.eq('zone', 'Rural')
+);
+
+var ruralCroplandChart = ui.Chart.feature.groups({
+  features: ruralAnnual,
+  xProperty: 'year',
+  yProperty: 'cropland_total_pct_land',
+  seriesProperty: 'city'
+})
+.setChartType('LineChart')
+.setOptions({
+  title: 'Rural reference cropland + cropland mosaic fraction',
+  hAxis: {
+    title: 'Year'
+  },
+  vAxis: {
+    title: 'Cropland + mosaic (% of land area)'
+  },
+  lineWidth: 2,
+  pointSize: 3,
+  legend: {
+    position: 'right'
+  }
+});
+
+print(ruralCroplandChart);
+
+
+// ============================================================
+// 12. CHART: RURAL NATURAL VEGETATION FRACTION THROUGH TIME
+// ============================================================
+
+var ruralNaturalChart = ui.Chart.feature.groups({
+  features: ruralAnnual,
+  xProperty: 'year',
+  yProperty: 'natural_vegetation_pct_land',
+  seriesProperty: 'city'
+})
+.setChartType('LineChart')
+.setOptions({
+  title: 'Rural reference natural/semi-natural vegetation fraction',
+  hAxis: {
+    title: 'Year'
+  },
+  vAxis: {
+    title: 'Natural vegetation (% of land area)'
+  },
+  lineWidth: 2,
+  pointSize: 3,
+  legend: {
+    position: 'right'
+  }
+});
+
+print(ruralNaturalChart);
+
+
+// ============================================================
+// 13. CHART: PERIOD-MEAN RURAL LANDSCAPE COMPOSITION
+// ============================================================
+
+var ruralPeriod = periodMeanLULC.filter(
+  ee.Filter.eq('zone', 'Rural')
+);
+
+var ruralCompositionChart = ui.Chart.feature.byFeature({
+  features: ruralPeriod,
+  xProperty: 'city',
+  yProperties: [
+    'mean_natural_vegetation_pct_land',
+    'mean_cropland_total_pct_land',
+    'mean_builtup_pct_land',
+    'mean_barren_pct_land'
+  ]
+})
+.setChartType('ColumnChart')
+.setOptions({
+  title: 'Period-mean rural reference composition',
+  hAxis: {
+    title: 'City'
+  },
+  vAxis: {
+    title: 'Percentage of land area'
+  },
+  legend: {
+    position: 'right'
+  }
+});
+
+print(ruralCompositionChart);
+
+
+// ============================================================
+// 14. MAP DISPLAY FOR CHECKING LAND COVER
+// ============================================================
+
+var DISPLAY_CITY_NAME = 'Melbourne';
+var DISPLAY_YEAR = 2024;
+
+function getCityByName(cityName) {
+
+  var selected = null;
+
+  CITIES.forEach(function(cityObj) {
+    if (cityObj.name === cityName) {
+      selected = cityObj;
+    }
+  });
+
+  return selected;
+
+}
+
+var displayCity = getCityByName(DISPLAY_CITY_NAME);
+var displayLC = getLCImage(DISPLAY_YEAR);
+
+var displayRegion = displayCity.urban
+  .merge(displayCity.rural)
+  .geometry();
+
+var lcVis = {
+  min: 1,
+  max: 17,
+  palette: [
+    '05450a', // 1 Evergreen Needleleaf Forest
+    '086a10', // 2 Evergreen Broadleaf Forest
+    '54a708', // 3 Deciduous Needleleaf Forest
+    '78d203', // 4 Deciduous Broadleaf Forest
+    '009900', // 5 Mixed Forest
+    'c6b044', // 6 Closed Shrubland
+    'dcd159', // 7 Open Shrubland
+    'dade48', // 8 Woody Savanna
+    'fbff13', // 9 Savanna
+    'b6ff05', // 10 Grassland
+    '27ff87', // 11 Wetland
+    'c24f44', // 12 Cropland
+    'a5a5a5', // 13 Urban
+    'ff6d4c', // 14 Cropland/Natural Mosaic
+    '69fff8', // 15 Snow/Ice
+    'f9ffa4', // 16 Barren
+    '1c0dff'  // 17 Water
+  ]
+};
+
+var urbanStyle = {
+  color: 'red',
+  fillColor: '00000000',
+  width: 2
+};
+
+var ruralStyle = {
+  color: 'blue',
+  fillColor: '00000000',
+  width: 2
+};
+
+Map.centerObject(displayRegion, 9);
+
+Map.addLayer(
+  displayLC.clip(displayRegion),
+  lcVis,
+  'MODIS LC_Type1 ' + DISPLAY_YEAR + ': ' + DISPLAY_CITY_NAME
+);
+
+Map.addLayer(
+  displayCity.rural.style(ruralStyle),
+  {},
+  DISPLAY_CITY_NAME + ' rural reference'
+);
+
+Map.addLayer(
+  displayCity.urban.style(urbanStyle),
+  {},
+  DISPLAY_CITY_NAME + ' urban'
+);
+
+
+// ============================================================
+// 15. EXPORT TABLES
+// ============================================================
+
+// Annual full table
+Export.table.toDrive({
+  collection: annualLULC,
+  description: 'Australia_5Cities_MODIS_LULC_Annual_Urban_Rural_2003_2024',
+  fileNamePrefix: 'Australia_5Cities_MODIS_LULC_Annual_Urban_Rural_2003_2024',
+  fileFormat: 'CSV'
+});
+
+
+// Period-mean urban and rural summary
+Export.table.toDrive({
+  collection: periodMeanLULC,
+  description: 'Australia_5Cities_MODIS_LULC_PeriodMean_Urban_Rural_2003_2024',
+  fileNamePrefix: 'Australia_5Cities_MODIS_LULC_PeriodMean_Urban_Rural_2003_2024',
+  fileFormat: 'CSV'
+});
+
+
+// Rural-only reviewer QA table
+Export.table.toDrive({
+  collection: ruralReferenceQA,
+  description: 'Australia_5Cities_MODIS_LULC_Rural_Reference_QA_2003_2024',
+  fileNamePrefix: 'Australia_5Cities_MODIS_LULC_Rural_Reference_QA_2003_2024',
+  fileFormat: 'CSV'
+});
+
+
+// ============================================================
+// 16. INTERPRETATION NOTES
+// ============================================================
+//
+// Use the rural-only QA table in your reviewer response.
+//
+// Important columns:
+//
+// mean_natural_vegetation_pct_land:
+//   Forest + shrubland + savanna + grassland + wetland.
+//
+// mean_cropland_total_pct_land:
+//   Cropland + cropland/natural vegetation mosaic.
+//
+// mean_builtup_pct_land:
+//   Built-up pixels inside rural reference.
+//   High value suggests possible peri-urban contamination.
+//
+// mean_disturbed_managed_pct_land:
+//   Cropland + cropland mosaic + built-up.
+//
+// overall_reference_flag:
+//   Simple interpretation label based on land-cover composition.
+//
+// Suggested response logic:
+//
+// 1. If rural natural vegetation is high:
+//    The rural reference is mostly natural/semi-natural.
+//
+// 2. If cropland_total is high:
+//    Acknowledge agricultural influence and vegetation phenology.
+//
+// 3. If built-up is high:
+//    Acknowledge possible peri-urban contamination.
+//
+// 4. If cropland/natural mosaic is present:
+//    Mention that rural reference includes mixed managed-natural
+//    vegetation, which may affect seasonal LST variability.
+//
+// ============================================================
